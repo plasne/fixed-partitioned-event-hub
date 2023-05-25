@@ -21,17 +21,20 @@ using Microsoft.Extensions.Logging;
 /// It supports automatic checkpointing on lease renewal.
 /// </summary>
 [ExcludeFromCodeCoverage]
-public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPartition>
+public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPartition>, IDisposable
 {
     private readonly BlobContainerClient containerClient;
     private readonly EventHubFixedPartitionProcessorOptions options;
     private readonly ILogger<EventHubFixedPartitionProcessor> logger;
     private readonly Dictionary<string, AzureBlobLease> owned = new();
+    private readonly SemaphoreSlim stateLock = new(1, 1);
     private readonly SemaphoreSlim ownedLock = new(1, 1);
     private readonly long[] dirtyOffsets = new long[32];
     private readonly long[] committedOffsets = new long[32];
     private readonly Random random = new();
+    private CancellationTokenSource cancellationTokenSource;
     private string[] partitions = null;
+    private bool disposed = false;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="EventHubFixedPartitionProcessor"/> class.
@@ -148,67 +151,133 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
     /// </summary>
     /// <param name="cancellationToken">If cancelled, the processing of events from Event Hub will soon stop.</param>
     /// <returns>A Task indicating completion.</returns>
+    /// <exception cref="InvalidOperationException">Thrown if the processor has already been started.</exception>
     /// <exception cref="PartitionIdOutOfRangeException">Thrown if the partition ID is not as expected.</exception>
     public override async Task StartProcessingAsync(CancellationToken cancellationToken = default)
     {
-        this.logger.LogDebug("starting EventHubFixedPartitionProcessor blob leasing...");
-
-        // set all offsets to uninitialized
-        for (int i = 0; i < 32; i++)
+        // ensure there are no race conditions with multiple starts or stops
+        await this.stateLock.WaitAsync(cancellationToken);
+        try
         {
-            Interlocked.Exchange(ref this.dirtyOffsets[i], -1);
-            Interlocked.Exchange(ref this.committedOffsets[i], -1);
-        }
-
-        // get a list of all partition ids
-        await using var connection = this.CreateConnection();
-        var path = $"{connection.FullyQualifiedNamespace}/{connection.EventHubName}/{this.ConsumerGroup}/ownership";
-        this.partitions = await this.ListPartitionIdsAsync(connection, cancellationToken);
-        foreach (var partition in this.partitions)
-        {
-            // ensure numeric and in range
-            if (!int.TryParse(partition, out int idx) || idx < 0 || idx > 31)
+            // ensure it cannot be started more than once
+            if (this.partitions is not null)
             {
-                throw new PartitionIdOutOfRangeException(partition);
+                throw new InvalidOperationException("This processor has already been started.");
             }
 
-            // create a blob for each partition
-            var blob = $"{path}/{partition}";
-            try
-            {
-                BlobClient blobClient = this.containerClient.GetBlobClient(blob);
-                BlobRequestConditions requestConditions = new() { IfNoneMatch = ETag.All };
-                using MemoryStream emptyStream = new(Array.Empty<byte>());
-                this.logger.LogDebug("attempting to create blob '{b}' for EventHubFixedPartitionProcessor.", blob);
-                BlobContentInfo info = await blobClient.UploadAsync(emptyStream, conditions: requestConditions, cancellationToken: cancellationToken);
-                this.logger.LogInformation("created blob '{b}' for EventHubFixedPartitionProcessor.", blob);
-            }
-            catch (RequestFailedException e) when (e.ErrorCode == BlobErrorCode.BlobAlreadyExists || e.ErrorCode == BlobErrorCode.ConditionNotMet || e.ErrorCode == BlobErrorCode.LeaseIdMissing)
-            {
-                this.logger.LogDebug("blob '{b}' for EventHubFixedPartitionProcessor already existed.", blob);
-            }
-        }
+            // log the start
+            this.logger.LogDebug("starting EventHubFixedPartitionProcessor blob leasing...");
 
-        // start the loop
-        _ = Task.Run(
-            async () =>
+            // create a new CTS based on the cancellation token; this way the StopProcessingAsync method can cancel if necessary
+            this.cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            // set all offsets to uninitialized
+            for (int i = 0; i < 32; i++)
             {
-                this.logger.LogInformation("started EventHubFixedPartitionProcessor blob leasing.");
-                while (true)
+                Interlocked.Exchange(ref this.dirtyOffsets[i], -1);
+                Interlocked.Exchange(ref this.committedOffsets[i], -1);
+            }
+
+            // get a list of all partition ids
+            await using var connection = this.CreateConnection();
+            var path = $"{connection.FullyQualifiedNamespace}/{connection.EventHubName}/{this.ConsumerGroup}/ownership";
+            this.partitions = await this.ListPartitionIdsAsync(connection, this.cancellationTokenSource.Token);
+            foreach (var partition in this.partitions)
+            {
+                // ensure numeric and in range
+                if (!int.TryParse(partition, out int idx) || idx < 0 || idx > 31)
                 {
-                    if (!cancellationToken.IsCancellationRequested)
-                    {
-                        await this.AssignAsync(path, cancellationToken);
-                        await this.RenewAsync(path, cancellationToken);
-                    }
-
-                    await this.ReleaseAsync();
-                    await Task.Delay(1000, cancellationToken);
+                    throw new PartitionIdOutOfRangeException(partition);
                 }
-            }, cancellationToken: cancellationToken);
 
-        // run the base
-        await base.StartProcessingAsync(cancellationToken);
+                // create a blob for each partition
+                var blob = $"{path}/{partition}";
+                try
+                {
+                    BlobClient blobClient = this.containerClient.GetBlobClient(blob);
+                    BlobRequestConditions requestConditions = new() { IfNoneMatch = ETag.All };
+                    using MemoryStream emptyStream = new(Array.Empty<byte>());
+                    this.logger.LogDebug("attempting to create blob '{b}' for EventHubFixedPartitionProcessor.", blob);
+                    BlobContentInfo info = await blobClient.UploadAsync(emptyStream, conditions: requestConditions, cancellationToken: this.cancellationTokenSource.Token);
+                    this.logger.LogInformation("created blob '{b}' for EventHubFixedPartitionProcessor.", blob);
+                }
+                catch (RequestFailedException e) when (e.ErrorCode == BlobErrorCode.BlobAlreadyExists || e.ErrorCode == BlobErrorCode.ConditionNotMet || e.ErrorCode == BlobErrorCode.LeaseIdMissing)
+                {
+                    this.logger.LogDebug("blob '{b}' for EventHubFixedPartitionProcessor already existed.", blob);
+                }
+            }
+
+            // start the loop
+            _ = Task.Run(
+                async () =>
+                {
+                    this.logger.LogInformation("started EventHubFixedPartitionProcessor blob leasing.");
+                    while (true)
+                    {
+                        if (!this.cancellationTokenSource.Token.IsCancellationRequested)
+                        {
+                            await this.AssignAsync(path, this.cancellationTokenSource.Token);
+                            await this.RenewAsync(path, this.cancellationTokenSource.Token);
+                        }
+
+                        await this.ReleaseAsync();
+                        await Task.Delay(1000, this.cancellationTokenSource.Token);
+                    }
+                }, cancellationToken: this.cancellationTokenSource.Token);
+
+            // run the base
+            await base.StartProcessingAsync(this.cancellationTokenSource.Token);
+        }
+        finally
+        {
+            this.stateLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// This stops the processing of events from Event Hub.
+    /// </summary>
+    /// <param name="cancellationToken">A token to cancel the stopping.</param>
+    /// <returns>A Task indicating completion.</returns>
+    public override async Task StopProcessingAsync(CancellationToken cancellationToken = default)
+    {
+        // ensure there are no race conditions with multiple starts or stops
+        await this.stateLock.WaitAsync(cancellationToken);
+        try
+        {
+            this.cancellationTokenSource.Cancel();
+            await base.StopProcessingAsync(cancellationToken);
+        }
+        finally
+        {
+            this.stateLock.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        this.Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
+    /// Disposes of the managed and unmanaged resources used by the <see cref="EventHubFixedPartitionProcessor"/> instance.
+    /// </summary>
+    /// <param name="disposing">True if the method is being called from the Dispose method, false otherwise.</param>
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!this.disposed)
+        {
+            if (disposing)
+            {
+                // Dispose managed resources here
+                this.cancellationTokenSource?.Dispose();
+            }
+
+            // Dispose unmanaged resources here
+            this.disposed = true;
+        }
     }
 
     /// <summary>
@@ -306,6 +375,10 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
             if (this.OnErrorAsync is not null)
             {
                 await this.OnErrorAsync(this, exception, partition, operationDescription, cancellationToken);
+            }
+            else
+            {
+                this.logger.LogError(exception, "an exception was raised while EventHubFixedPartitionProcessor was looking for events...");
             }
         }
         catch (Exception ex)
