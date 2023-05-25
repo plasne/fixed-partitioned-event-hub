@@ -1,7 +1,5 @@
 # Fixed Partition Event Hub Processor
 
-## Why?
-
 I was working with a customer to build a processing pipeline with multiple stages. Stage 1 would read data from an Event Hub and publish data to another Event Hub. Stage 2 would read data from that Event Hub and publish data to another Event Hub. And so on - each stage would read the output of the prior stage for its input.
 
 - Stage 1 had a very high throughput requirement which would benefit from batching and needed to checkpoint.
