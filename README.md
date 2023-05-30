@@ -1,5 +1,17 @@
 # Fixed Partition Event Hub Processor
 
+This sample could be useful to anyone wanting to implement a custom Event Hub processor to meet a unqiue set of requirements. In this specific case, this processor was designed to meet the following requirements:
+
+- __Fixed Number of Partitions__. This processor allows you to specify the number of partitions that each consumer will process. It will not attempt to take ownership of any additional partitions, leaving those for other consumers. In cases where the reassignment of partitions would be problematic, this can be important.
+
+- __Batching__. In some cases, such as writing records to a database, it may be significantly more performant to write records in batches rather than one at a time.
+
+- __Lazy Checkpointing__. If a solution already has a way to address duplicate events, it may be more efficient to checkpoint less frequently. In this case, the processor will checkpoint every few seconds instead of on every event or batch.
+
+- __Dedicated Ownership__. Unlike the EventProcessorClient, this processor does not allow other consumers to steal partitions. If a consumer stores content in memory, stealing partitions may be very disruptive.
+
+## Why?
+
 I was working with a customer to build a processing pipeline with multiple stages. Stage 1 would read data from an Event Hub and publish data to another Event Hub. Stage 2 would read data from that Event Hub and publish data to another Event Hub. And so on - each stage would read the output of the prior stage for its input.
 
 - Stage 1 had a very high throughput requirement which would benefit from batching and needed to checkpoint.
