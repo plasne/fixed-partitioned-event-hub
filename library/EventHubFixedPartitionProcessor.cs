@@ -207,27 +207,8 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
                 }
             }
 
-            // start the loop
-            _ = Task.Run(
-                async () =>
-                {
-                    this.logger.LogInformation("started EventHubFixedPartitionProcessor blob leasing.");
-                    while (true)
-                    {
-                        var isShutdown = this.cancellationTokenSource.Token.IsCancellationRequested;
-                        if (isShutdown)
-                        {
-                            await this.ReleaseAsync(isShutdown);
-                        }
-                        else
-                        {
-                            await this.AssignAsync(path, this.cancellationTokenSource.Token);
-                            await this.RenewAsync(path, this.cancellationTokenSource.Token);
-                            await this.ReleaseAsync(isShutdown);
-                            await this.DelayAsync();
-                        }
-                    }
-                }, cancellationToken: cancellationToken);
+            // start managing leases
+            _ = this.StartManagingLeasesAsync(path);
 
             // run the base
             await base.StartProcessingAsync(this.cancellationTokenSource.Token);
@@ -487,6 +468,37 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
         }
     }
 
+    private async Task StartManagingLeasesAsync(string path)
+    {
+        try
+        {
+            this.logger.LogInformation("started EventHubFixedPartitionProcessor blob leasing.");
+            while (true)
+            {
+                var isShutdown = this.cancellationTokenSource.Token.IsCancellationRequested;
+                if (isShutdown)
+                {
+                    await this.ReleaseAsync(isShutdown);
+                }
+                else
+                {
+                    await this.AssignAsync(path, this.cancellationTokenSource.Token);
+                    await this.RenewAsync(path, this.cancellationTokenSource.Token);
+                    await this.ReleaseAsync(isShutdown);
+                    await this.DelayAsync(this.cancellationTokenSource.Token);
+                }
+            }
+        }
+        catch (TaskCanceledException)
+        {
+            // ignore
+        }
+        catch (Exception ex)
+        {
+            this.logger.LogCritical(ex, "an exception was raised while EventHubFixedPartitionProcessor was managing leases...");
+        }
+    }
+
     private async Task AssignAsync(string path, CancellationToken cancellationToken)
     {
         try
@@ -569,7 +581,7 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
         }
         catch (Exception ex)
         {
-            this.logger.LogError(ex, "an exception was raised during EventHubFixedPartitionProcessor assignment.");
+            this.logger.LogError(ex, "an exception was raised during EventHubFixedPartitionProcessor assignment...");
         }
     }
 
@@ -694,11 +706,11 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
         }
     }
 
-    private async Task DelayAsync()
+    private async Task DelayAsync(CancellationToken cancellationToken)
     {
         try
         {
-            await Task.Delay(1000, this.cancellationTokenSource.Token);
+            await Task.Delay(1000, cancellationToken);
         }
         catch (TaskCanceledException)
         {
