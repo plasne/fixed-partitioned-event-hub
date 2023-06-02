@@ -214,16 +214,20 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
                     this.logger.LogInformation("started EventHubFixedPartitionProcessor blob leasing.");
                     while (true)
                     {
-                        if (!this.cancellationTokenSource.Token.IsCancellationRequested)
+                        var isShutdown = this.cancellationTokenSource.Token.IsCancellationRequested;
+                        if (isShutdown)
+                        {
+                            await this.ReleaseAsync(isShutdown);
+                        }
+                        else
                         {
                             await this.AssignAsync(path, this.cancellationTokenSource.Token);
                             await this.RenewAsync(path, this.cancellationTokenSource.Token);
+                            await this.ReleaseAsync(isShutdown);
+                            await this.DelayAsync();
                         }
-
-                        await this.ReleaseAsync();
-                        await Task.Delay(1000, this.cancellationTokenSource.Token);
                     }
-                }, cancellationToken: this.cancellationTokenSource.Token);
+                }, cancellationToken: cancellationToken);
 
             // run the base
             await base.StartProcessingAsync(this.cancellationTokenSource.Token);
@@ -642,7 +646,7 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
         }
     }
 
-    private async Task ReleaseAsync()
+    private async Task ReleaseAsync(bool isShutdown)
     {
         try
         {
@@ -651,7 +655,7 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
             var ownedPartitions = await this.GetOwnedPartitionsAsync();
             foreach (var pair in ownedPartitions)
             {
-                if (DateTime.UtcNow > pair.Value.TimeoutAt)
+                if (isShutdown && DateTime.UtcNow > pair.Value.TimeoutAt)
                 {
                     markedForDeletion.Add(pair.Key);
                 }
@@ -662,7 +666,16 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
             {
                 // release
                 await this.DropOwnershipAsync(key);
-                this.logger.LogWarning("ownership of key {k} was released due to failed renewals in EventHubFixedPartitionProcessor.", key);
+
+                // log
+                if (isShutdown)
+                {
+                    this.logger.LogInformation("ownership of key {k} was released due to shutdown.", key);
+                }
+                else
+                {
+                    this.logger.LogWarning("ownership of key {k} was released due to failed renewals in EventHubFixedPartitionProcessor.", key);
+                }
 
                 // notify of release
                 if (this.OnReleasedAsync is not null)
@@ -678,6 +691,22 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
         catch (Exception ex)
         {
             this.logger.LogError(ex, "an exception was raised during EventHubFixedPartitionProcessor release...");
+        }
+    }
+
+    private async Task DelayAsync()
+    {
+        try
+        {
+            await Task.Delay(1000, this.cancellationTokenSource.Token);
+        }
+        catch (TaskCanceledException)
+        {
+            // ignore
+        }
+        catch (Exception ex)
+        {
+            this.logger.LogError(ex, "an exception was raised during EventHubFixedPartitionProcessor delay...");
         }
     }
 }
