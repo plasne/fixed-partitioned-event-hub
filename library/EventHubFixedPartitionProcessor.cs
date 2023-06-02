@@ -36,6 +36,12 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
     private string[] partitions = null;
     private bool disposed = false;
 
+    private OnAssignedDelegateAsync onAssignedAsync;
+    private OnRenewedDelegateAsync onRenewedAsync;
+    private OnReleasedDelegateAsync onReleasedAsync;
+    private OnBatchDelegateAsync onBatchAsync;
+    private OnErrorDelegateAsync onErrorAsync;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="EventHubFixedPartitionProcessor"/> class.
     /// </summary>
@@ -91,7 +97,7 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
     /// <param name="partition">The partition.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
-    public delegate Task OnBatchAsyncDelegate(object sender, IEnumerable<EventData> events, EventProcessorPartition partition, CancellationToken cancellationToken);
+    public delegate Task OnBatchDelegateAsync(object sender, IEnumerable<EventData> events, EventProcessorPartition partition, CancellationToken cancellationToken);
 
     /// <summary>
     /// Represents a method that will be called when an exception is raised trying to get a batch of events.
@@ -102,32 +108,97 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
     /// <param name="operationDescription">The operation that was being attempted.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
-    public delegate Task OnErrorAsyncDelegate(object sender, Exception exception, EventProcessorPartition partition, string operationDescription, CancellationToken cancellationToken);
+    public delegate Task OnErrorDelegateAsync(object sender, Exception exception, EventProcessorPartition partition, string operationDescription, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Represents an event that is raised when partitions are assigned to this instance.
+    /// Gets or sets the method that will be called when partitions are assigned.
     /// </summary>
-    public event OnAssignedDelegateAsync OnAssignedAsync;
+    public event OnAssignedDelegateAsync OnAssignedAsync
+    {
+        add
+        {
+            this.onAssignedAsync = this.onAssignedAsync is null
+                ? value
+                : throw new InvalidOperationException("OnAssignedAsync already has an event handler assigned.");
+        }
+
+        remove
+        {
+            this.onAssignedAsync = null;
+        }
+    }
 
     /// <summary>
-    /// Represents an event that is raised when partitions are renewed for this instance.
+    /// Gets or sets the method that will be called when partitions are renewed.
     /// </summary>
-    public event OnRenewedDelegateAsync OnRenewedAsync;
+    public event OnRenewedDelegateAsync OnRenewedAsync
+    {
+        add
+        {
+            this.onRenewedAsync = this.onRenewedAsync is null
+                ? value
+                : throw new InvalidOperationException("OnRenewedAsync already has an event handler assigned.");
+        }
+
+        remove
+        {
+            this.onRenewedAsync = null;
+        }
+    }
 
     /// <summary>
-    /// Represents an event that is raised when partitions are released from this instance.
+    /// Gets or sets the method that will be called when partitions are released.
     /// </summary>
-    public event OnReleasedDelegateAsync OnReleasedAsync;
+    public event OnReleasedDelegateAsync OnReleasedAsync
+    {
+        add
+        {
+            this.onReleasedAsync = this.onReleasedAsync is null
+                ? value
+                : throw new InvalidOperationException("OnReleasedAsync already has an event handler assigned.");
+        }
+
+        remove
+        {
+            this.onReleasedAsync = null;
+        }
+    }
 
     /// <summary>
-    /// Represents an event that is raised when a batch is ready for processing.
+    /// Gets or sets the method that will be called when a batch is available.
     /// </summary>
-    public event OnBatchAsyncDelegate OnBatchAsync;
+    public event OnBatchDelegateAsync OnBatchAsync
+    {
+        add
+        {
+            this.onBatchAsync = this.onBatchAsync is null
+                ? value
+                : throw new InvalidOperationException("OnBatchAsync already has an event handler assigned.");
+        }
+
+        remove
+        {
+            this.onBatchAsync = null;
+        }
+    }
 
     /// <summary>
-    /// Represents an event that is raised when an exception is raised.
+    /// Gets or sets the method that will be called when an error is raised.
     /// </summary>
-    public event OnErrorAsyncDelegate OnErrorAsync;
+    public event OnErrorDelegateAsync OnErrorAsync
+    {
+        add
+        {
+            this.onErrorAsync = this.onErrorAsync is null
+                ? value
+                : throw new InvalidOperationException("OnErrorAsync already has an event handler assigned.");
+        }
+
+        remove
+        {
+            this.onErrorAsync = null;
+        }
+    }
 
     /// <summary>
     /// This returns a list of partitions that are owned by this instance.
@@ -324,9 +395,9 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
             }
 
             // process
-            if (this.OnBatchAsync is not null)
+            if (this.onBatchAsync is not null)
             {
-                await this.OnBatchAsync(this, events, partition, cancellationToken);
+                await this.onBatchAsync(this, events, partition, cancellationToken);
             }
 
             // checkpoint
@@ -357,9 +428,9 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
     {
         try
         {
-            if (this.OnErrorAsync is not null)
+            if (this.onErrorAsync is not null)
             {
-                await this.OnErrorAsync(this, exception, partition, operationDescription, cancellationToken);
+                await this.onErrorAsync(this, exception, partition, operationDescription, cancellationToken);
             }
             else
             {
@@ -562,9 +633,9 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
                     });
 
                     // notify of assignment
-                    if (this.OnAssignedAsync is not null)
+                    if (this.onAssignedAsync is not null)
                     {
-                        await this.OnAssignedAsync(this, blobName);
+                        await this.onAssignedAsync(this, blobName);
                     }
 
                     break; // only assign 1 at a time
@@ -631,9 +702,9 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
                         }
 
                         // notify of renewal
-                        if (this.OnRenewedAsync is not null)
+                        if (this.onRenewedAsync is not null)
                         {
-                            await this.OnRenewedAsync(this, blobName);
+                            await this.onRenewedAsync(this, blobName);
                         }
                     }
                 }
@@ -690,9 +761,9 @@ public class EventHubFixedPartitionProcessor : EventProcessor<EventProcessorPart
                 }
 
                 // notify of release
-                if (this.OnReleasedAsync is not null)
+                if (this.onReleasedAsync is not null)
                 {
-                    await this.OnReleasedAsync(this, key);
+                    await this.onReleasedAsync(this, key);
                 }
             }
         }
